@@ -117,32 +117,196 @@ def test_positions_past_thinker_reply_keep_codec_embedding():
     assert torch.equal(out_embeds[1:], base[1:])
 
 
-def test_one_token_prefill_tail_routes_to_prefill():
-    # Chunked prefill can end in a span_len == 1 tail. With the runner
-    # metadata saying is_prefill, the row must go down the prefill path and
-    # must not touch the decode-side reply buffer (the span heuristic would
-    # have misrouted it to decode and consumed one row).
-    model = _make_minimal_model()
-    sentinel = (torch.tensor([0]), torch.zeros(1, HIDDEN), {"via": "prefill"})
-    calls = []
+THINKER_PROMPT_LEN = 6
+TALKER_PROMPT_LEN = THINKER_PROMPT_LEN + 2  # thinker prompt + speaker/pad row + BOS row
+CODEC_PAD, CODEC_START, CODEC_MASK = 8292, 8293, 8296
 
-    def fake_prefill_process(input_ids, input_embeds, payload):
-        calls.append(input_ids)
-        return sentinel
 
-    model.thinker_to_talker_process = fake_prefill_process
+class _FakeTalker(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.config = SimpleNamespace(hidden_size=HIDDEN)
+        self.anchor = torch.nn.Parameter(torch.zeros(1), requires_grad=False)
 
-    out = model.talker_preprocess(
-        torch.tensor([5], dtype=torch.long),
-        None,
-        embed={"thinker_reply": _thinker_reply(4)},
-        _omni_is_prefill=True,
-        _omni_prompt_len=8,
-        _omni_num_computed_tokens=7,
+    def embed_input_ids(self, ids: torch.Tensor) -> torch.Tensor:
+        return _fake_embed_input_ids(ids)
+
+
+def _make_prefill_model():
+    """Minimal model on which the real ``_thinker_to_talker_prefill`` runs."""
+    cls = _qwen2_5_omni_mod().Qwen2_5OmniForConditionalGeneration
+    model = cls.__new__(cls)
+    torch.nn.Module.__init__(model)
+    model.talker = _FakeTalker()
+    model.model = model.talker
+    model.talker_config = SimpleNamespace(
+        tts_codec_pad_token_id=CODEC_PAD,
+        tts_codec_start_token_id=CODEC_START,
+        tts_codec_mask_token_id=CODEC_MASK,
+    )
+    model.voice_type = "Chelsie"
+    model.embed_text_bos_token = torch.full((1, HIDDEN), 7.0)
+    model.embed_text_spk_tokens = {}
+    model.embed_codec_pad_token = torch.full((1, HIDDEN), 0.5)
+    model.embed_codec_bos_token = torch.full((1, HIDDEN), 0.25)
+    return model
+
+
+def _thinker_payload(num_output_rows: int = 5) -> dict:
+    # Thinker prompt row i is 1000 * (i + 1); thinker output row k is
+    # 10 * (k + 1), so ``thinker_reply`` (output rows 1:) starts at 20.
+    prompt = (torch.arange(1, THINKER_PROMPT_LEN + 1, dtype=torch.float32).reshape(-1, 1) * 1000.0).expand(-1, HIDDEN)
+    output = (torch.arange(1, num_output_rows + 1, dtype=torch.float32).reshape(-1, 1) * 10.0).expand(-1, HIDDEN)
+    return dict(
+        embed={"prefill": prompt.contiguous()},
+        hidden_states={"output": output.contiguous()},
+        ids={"prompt": list(range(100, 100 + THINKER_PROMPT_LEN)), "output": list(range(200, 200 + num_output_rows))},
     )
 
-    assert len(calls) == 1
-    assert out == sentinel
+
+def _full_talker_prompt(model, payload):
+    """The complete prompt as reconstructed for an unchunked prefill."""
+    ids, embeds, _ = model.talker_preprocess(
+        torch.zeros(TALKER_PROMPT_LEN, dtype=torch.long),
+        None,
+        **payload,
+        _omni_is_prefill=True,
+        _omni_prompt_len=TALKER_PROMPT_LEN,
+        _omni_num_computed_tokens=0,
+    )
+    assert ids.shape[0] == embeds.shape[0] == TALKER_PROMPT_LEN
+    return ids, embeds
+
+
+@pytest.mark.parametrize(("num_computed", "span_len"), [(7, 1), (2, 3), (0, 4)])
+def test_chunked_prefill_span_gets_rows_at_its_offset(num_computed, span_len):
+    # The runner copies the returned rows into the positions it scheduled,
+    # starting at num_computed_tokens. A chunk at a non-zero offset (e.g. a
+    # 1-token tail at offset 7) must receive those prompt rows, not row 0.
+    model = _make_prefill_model()
+    payload = _thinker_payload()
+    full_ids, full_embeds = _full_talker_prompt(model, payload)
+
+    out_ids, out_embeds, update = model.talker_preprocess(
+        torch.zeros(span_len, dtype=torch.long),
+        None,
+        **payload,
+        _omni_is_prefill=True,
+        _omni_prompt_len=TALKER_PROMPT_LEN,
+        _omni_num_computed_tokens=num_computed,
+    )
+
+    end = num_computed + span_len
+    assert torch.equal(out_ids, full_ids[num_computed:end])
+    assert torch.equal(out_embeds, full_embeds[num_computed:end])
+    assert torch.equal(update["embed"]["thinker_reply"], payload["hidden_states"]["output"][1:])
+
+
+def test_prefill_tail_row_is_first_thinker_output_plus_bos():
+    # The last prompt row conditions on thinker output row 0 plus codec BOS;
+    # a 1-token tail at offset 7 must receive exactly that row.
+    model = _make_prefill_model()
+    payload = _thinker_payload()
+
+    out_ids, out_embeds, _ = model.talker_preprocess(
+        torch.tensor([5], dtype=torch.long),
+        None,
+        **payload,
+        _omni_is_prefill=True,
+        _omni_prompt_len=TALKER_PROMPT_LEN,
+        _omni_num_computed_tokens=TALKER_PROMPT_LEN - 1,
+    )
+
+    assert out_ids.tolist() == [CODEC_START]
+    expected = payload["hidden_states"]["output"][:1] + model.embed_codec_bos_token
+    assert torch.equal(out_embeds, expected)
+
+
+def _original_decode_embeds(model, payload, generated_ids):
+    """Embeddings the decode steps produced before preemption, one step at a time."""
+    _, _, update = model.talker_preprocess(
+        torch.zeros(TALKER_PROMPT_LEN, dtype=torch.long),
+        None,
+        **payload,
+        _omni_is_prefill=True,
+        _omni_prompt_len=TALKER_PROMPT_LEN,
+        _omni_num_computed_tokens=0,
+    )
+    rows = []
+    for k, token in enumerate(generated_ids):
+        _, embeds, _ = model.talker_preprocess(
+            torch.tensor([token], dtype=torch.long),
+            None,
+            embed={**payload["embed"], **update["embed"]},
+            _omni_is_prefill=False,
+            _omni_prompt_len=TALKER_PROMPT_LEN,
+            _omni_num_computed_tokens=TALKER_PROMPT_LEN + k,
+        )
+        rows.append(embeds)
+    return torch.cat(rows)
+
+
+@pytest.mark.parametrize("num_computed", [0, 5])
+def test_replay_span_crossing_prompt_boundary_conditions_generated_suffix(num_computed):
+    # After preemption the scheduler resets num_computed_tokens to 0 but keeps
+    # the generated tokens, and may schedule the prompt plus those tokens in
+    # one span (or, with chunking, a span starting inside the prompt). The
+    # prompt rows come from the reconstructed prompt at the offset; the
+    # generated suffix must get the same thinker-conditioned embeddings as the
+    # original decode steps, which a prompt-only result would leave unset.
+    model = _make_prefill_model()
+    payload = _thinker_payload()
+    full_ids, full_embeds = _full_talker_prompt(model, payload)
+    generated = [301, 302, 303]
+    span_ids = torch.cat(
+        [
+            torch.zeros(TALKER_PROMPT_LEN - num_computed, dtype=torch.long),
+            torch.tensor(generated, dtype=torch.long),
+        ]
+    )
+
+    out_ids, out_embeds, _ = model.talker_preprocess(
+        span_ids,
+        None,
+        **payload,
+        _omni_is_prefill=True,
+        _omni_prompt_len=TALKER_PROMPT_LEN,
+        _omni_num_computed_tokens=num_computed,
+    )
+
+    num_prompt = TALKER_PROMPT_LEN - num_computed
+    assert out_ids.shape[0] == out_embeds.shape[0] == span_ids.shape[0]
+    assert torch.equal(out_ids[:num_prompt], full_ids[num_computed:])
+    assert torch.equal(out_embeds[:num_prompt], full_embeds[num_computed:])
+    assert out_ids[num_prompt:].tolist() == generated
+    assert torch.equal(out_embeds[num_prompt:], _original_decode_embeds(model, payload, generated))
+
+
+def test_repeated_replay_span_is_identical():
+    # A request can be preempted and replayed more than once; each replay of
+    # the same span must rebuild identical embeddings.
+    model = _make_prefill_model()
+    payload = _thinker_payload()
+    span_ids = torch.cat([torch.zeros(TALKER_PROMPT_LEN, dtype=torch.long), torch.tensor([301, 302])])
+    meta = dict(_omni_is_prefill=True, _omni_prompt_len=TALKER_PROMPT_LEN, _omni_num_computed_tokens=0)
+
+    _, first, _ = model.talker_preprocess(span_ids, None, **payload, **meta)
+    _, second, _ = model.talker_preprocess(span_ids, None, **payload, **meta)
+
+    assert torch.equal(first, second)
+
+
+def test_prefill_without_runner_metadata_returns_full_prompt():
+    # Legacy callers without the runner metadata keep receiving the complete
+    # reconstructed prompt, as before.
+    model = _make_prefill_model()
+    payload = _thinker_payload()
+    full_ids, full_embeds = _full_talker_prompt(model, payload)
+
+    out_ids, out_embeds, _ = model.talker_preprocess(torch.zeros(TALKER_PROMPT_LEN, dtype=torch.long), None, **payload)
+
+    assert torch.equal(out_ids, full_ids)
+    assert torch.equal(out_embeds, full_embeds)
 
 
 def test_missing_runner_metadata_falls_back_to_legacy_single_step():

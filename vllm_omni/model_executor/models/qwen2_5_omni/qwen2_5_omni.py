@@ -722,8 +722,58 @@ class Qwen2_5OmniForConditionalGeneration(
             # Ensure we have base embeddings when only ids are provided
             if input_embeds is None and input_ids is not None:
                 input_embeds = self.talker.embed_input_ids(input_ids)
-            return self.thinker_to_talker_process(input_ids, input_embeds, payload)
+            return self.thinker_to_talker_prefill_span(input_ids, input_embeds, payload)
         return self.thinker_to_talker_decode(input_ids, input_embeds, payload)
+
+    def thinker_to_talker_prefill_span(self, input_ids, input_embeds, payload: OmniPayload):
+        """Assemble embeddings for a prefill span that starts at the runner offset.
+
+        :meth:`thinker_to_talker_process` reconstructs the complete Talker
+        prompt, while the runner copies the returned rows into the positions
+        it scheduled, starting at ``_omni_num_computed_tokens``. The prompt
+        rows are therefore sliced at that offset, so a later chunked-prefill
+        chunk (e.g. a 1-token tail at offset 7) receives its own rows rather
+        than the beginning of the prompt.
+
+        After preemption the scheduler resets ``num_computed_tokens`` to 0
+        while keeping the generated tokens, and may schedule the prompt and
+        those tokens in one span. Positions past the prompt are assembled by
+        the stateless :meth:`thinker_to_talker_decode`, using the
+        ``thinker_reply`` reconstructed by this call, so the replay matches
+        the embeddings of the original decode steps.
+
+        Without the runner metadata (legacy out-of-tree callers), the complete
+        reconstructed prompt is returned unchanged.
+        """
+        req_input_ids, req_embeds, update_dict = self.thinker_to_talker_process(input_ids, input_embeds, payload)
+        try:
+            offset = max(0, int(payload["_omni_num_computed_tokens"]))
+            prompt_len = int(payload["_omni_prompt_len"])
+        except (KeyError, TypeError, ValueError):
+            return req_input_ids, req_embeds, update_dict
+
+        span_len = int(input_ids.shape[0])
+        prompt_end = min(offset + span_len, prompt_len, int(req_embeds.shape[0]))
+        num_prompt = max(0, prompt_end - offset)
+        out_ids = req_input_ids[offset : offset + num_prompt]
+        out_embeds = req_embeds[offset : offset + num_prompt]
+
+        num_suffix = span_len - num_prompt
+        if num_suffix > 0:
+            embed = dict(payload.get("embed", {}))
+            embed.update(update_dict.get("embed", {}))
+            suffix_payload = {
+                **payload,
+                "embed": embed,
+                "_omni_num_computed_tokens": offset + num_prompt,
+                "_omni_prompt_len": prompt_len,
+            }
+            suffix_ids, suffix_embeds, _ = self.thinker_to_talker_decode(
+                input_ids[num_prompt:], input_embeds[num_prompt:], suffix_payload
+            )
+            out_ids = torch.cat([out_ids, suffix_ids.to(device=out_ids.device, dtype=out_ids.dtype)])
+            out_embeds = torch.cat([out_embeds, suffix_embeds.to(device=out_embeds.device, dtype=out_embeds.dtype)])
+        return out_ids, out_embeds, update_dict
 
     def thinker_to_talker_process(
         self,
