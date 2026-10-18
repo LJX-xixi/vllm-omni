@@ -1,15 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """
-Unit tests for the Qwen2.5-Omni talker preprocess phase routing and the
-stateless decode-span embedding assembly.
+Unit tests for Qwen2.5-Omni talker span assembly from the runner's positions.
 
-Regression tests for the span-length prefill/decode heuristic: a
-speculative-decoding verify step schedules num_draft_tokens + 1 decode
-positions in one span, and a chunked prefill can end in a 1-token tail —
-both misroute under ``span_len > 1``. The decode path must also assemble
-one ``thinker_reply`` row per position, statelessly, so a preempt/resume
-replay span reconstructs exactly the embeddings the original steps used.
+A chunked-prefill chunk, a speculative-decoding verify step and a preemption
+replay all schedule spans whose length does not identify their phase. Each
+position must receive the row for its absolute position: a prompt row of the
+reconstructed Talker prompt, or ``thinker_reply[k] + codec_embedding`` for
+generation offset ``k``. Replaying the same positions must rebuild the same rows.
 """
 
 import functools
@@ -296,37 +294,26 @@ def test_repeated_replay_span_is_identical():
     assert torch.equal(first, second)
 
 
-def test_prefill_without_runner_metadata_returns_full_prompt():
-    # Legacy callers without the runner metadata keep receiving the complete
-    # reconstructed prompt, as before.
+def test_missing_runner_metadata_is_rejected():
+    # Every in-tree runner supplies the span positions (#3662); without them
+    # the span cannot be assembled correctly, so preprocessing fails loudly.
     model = _make_prefill_model()
-    payload = _thinker_payload()
-    full_ids, full_embeds = _full_talker_prompt(model, payload)
 
-    out_ids, out_embeds, _ = model.talker_preprocess(torch.zeros(TALKER_PROMPT_LEN, dtype=torch.long), None, **payload)
-
-    assert torch.equal(out_ids, full_ids)
-    assert torch.equal(out_embeds, full_embeds)
+    with pytest.raises(ValueError, match="runner metadata"):
+        model.talker_preprocess(torch.zeros(TALKER_PROMPT_LEN, dtype=torch.long), None, **_thinker_payload())
 
 
-def test_missing_runner_metadata_falls_back_to_legacy_single_step():
-    # Out-of-tree callers that predate the #3662 runner metadata must keep the
-    # stock consuming single-step behavior, bit for bit.
-    model = _make_minimal_model()
-    sentinel = (torch.tensor([9]), torch.ones(1, HIDDEN), {"via": "legacy"})
-    calls = []
+def test_prompt_length_mismatch_is_rejected():
+    # If the reconstructed Talker prompt and the scheduled prompt disagree in
+    # length, slicing by position would silently misalign every row.
+    model = _make_prefill_model()
 
-    def fake_one_step(input_ids, input_embeds, payload):
-        calls.append(input_ids)
-        return sentinel
-
-    model.thinker_to_talker_decode_one_step = fake_one_step
-
-    out = model.talker_preprocess(
-        torch.tensor([9], dtype=torch.long),
-        None,
-        embed={"thinker_reply": _thinker_reply(4)},
-    )
-
-    assert len(calls) == 1
-    assert out == sentinel
+    with pytest.raises(ValueError, match="Reconstructed Talker prompt"):
+        model.talker_preprocess(
+            torch.zeros(4, dtype=torch.long),
+            None,
+            **_thinker_payload(),
+            _omni_is_prefill=True,
+            _omni_prompt_len=TALKER_PROMPT_LEN + 1,
+            _omni_num_computed_tokens=0,
+        )
