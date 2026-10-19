@@ -1351,7 +1351,14 @@ class Qwen3OmniMoeForConditionalGeneration(
             return self._next_thinker_decode_text_step(
                 cached_thinker_decode_embeds, thinker_decode_embed, meta, device, update_dict
             )
-        start_index = meta.get("num_processed_tokens", 0)
+        if meta.get("resumable", False):
+            start_index = meta.get("num_processed_tokens", 0)
+        else:
+            # Decode rows start at the first text token the prefill did not
+            # consume, one per generated frame, and rows that arrived during a
+            # chunked prefill are cached first. The row for this position is
+            # therefore the number of frames before it, not the text index.
+            start_index = payload["_omni_num_computed_tokens"] - payload["_omni_prompt_len"]
 
         if cached_thinker_decode_embeds is not None and start_index < cached_thinker_decode_embeds.shape[0]:
             cached_thinker_decode_embeds = to_device_nonblocking(cached_thinker_decode_embeds, device)
