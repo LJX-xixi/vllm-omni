@@ -137,6 +137,8 @@ def _make_prefill_model():
     torch.nn.Module.__init__(model)
     model.talker = _FakeTalker()
     model.model = model.talker
+    model.thinker_config = SimpleNamespace()
+    model.thinker_embedding = torch.nn.Embedding.from_pretrained(_fake_embed_input_ids(torch.arange(256)))
     model.talker_config = SimpleNamespace(
         tts_codec_pad_token_id=CODEC_PAD,
         tts_codec_start_token_id=CODEC_START,
@@ -145,14 +147,17 @@ def _make_prefill_model():
     model.voice_type = "Chelsie"
     model.embed_text_bos_token = torch.full((1, HIDDEN), 7.0)
     model.embed_text_spk_tokens = {}
+    model.embed_text_eos_token = torch.full((1, HIDDEN), 8.0)
+    model.embed_text_pad_token = torch.full((1, HIDDEN), 9.0)
     model.embed_codec_pad_token = torch.full((1, HIDDEN), 0.5)
     model.embed_codec_bos_token = torch.full((1, HIDDEN), 0.25)
     return model
 
 
 def _thinker_payload(num_output_rows: int = 5) -> dict:
-    # Thinker prompt row i is 1000 * (i + 1); thinker output row k is
-    # 10 * (k + 1), so ``thinker_reply`` (output rows 1:) starts at 20.
+    # Hidden rows and token embeddings are both position-distinguishing:
+    # prompt hidden row i is 1000 * (i + 1), output hidden row k is 10 * (k + 1),
+    # and each text-token embedding adds its token ID.
     prompt = (torch.arange(1, THINKER_PROMPT_LEN + 1, dtype=torch.float32).reshape(-1, 1) * 1000.0).expand(-1, HIDDEN)
     output = (torch.arange(1, num_output_rows + 1, dtype=torch.float32).reshape(-1, 1) * 10.0).expand(-1, HIDDEN)
     return dict(
@@ -197,12 +202,16 @@ def test_chunked_prefill_span_gets_rows_at_its_offset(num_computed, span_len):
     end = num_computed + span_len
     assert torch.equal(out_ids, full_ids[num_computed:end])
     assert torch.equal(out_embeds, full_embeds[num_computed:end])
-    assert torch.equal(update["embed"]["thinker_reply"], payload["hidden_states"]["output"][1:])
+    reply_conditioning = payload["hidden_states"]["output"] + _fake_embed_input_ids(
+        torch.tensor(payload["ids"]["output"])
+    )
+    expected_reply = torch.cat([reply_conditioning[1:], model.embed_text_eos_token, model.embed_text_pad_token])
+    assert torch.equal(update["embed"]["thinker_reply"], expected_reply)
 
 
 def test_prefill_tail_row_is_first_thinker_output_plus_bos():
-    # The last prompt row conditions on thinker output row 0 plus codec BOS;
-    # a 1-token tail at offset 7 must receive exactly that row.
+    # The last prompt row conditions on thinker output row 0 plus its text-token
+    # embedding and codec BOS; a 1-token tail at offset 7 must receive that row.
     model = _make_prefill_model()
     payload = _thinker_payload()
 
@@ -216,7 +225,11 @@ def test_prefill_tail_row_is_first_thinker_output_plus_bos():
     )
 
     assert out_ids.tolist() == [CODEC_START]
-    expected = payload["hidden_states"]["output"][:1] + model.embed_codec_bos_token
+    expected = (
+        payload["hidden_states"]["output"][:1]
+        + _fake_embed_input_ids(torch.tensor(payload["ids"]["output"][:1]))
+        + model.embed_codec_bos_token
+    )
     assert torch.equal(out_embeds, expected)
 
 
