@@ -93,10 +93,13 @@ def test_decode_span_is_replayable():
     assert torch.equal(first, second)
 
 
-def test_positions_past_thinker_reply_keep_codec_embedding():
-    # Near the end of the thinker text the span can extend past the last
-    # reply row; those positions keep the plain codec embedding (the verifier
-    # rejects drafts there naturally).
+@pytest.mark.parametrize(
+    ("offset", "expected_rows"),
+    [(4, [4, 5, 5]), (5, [5, 5, 5]), (6, [5, 5, 5]), (9, [5, 5, 5])],
+)
+def test_positions_past_thinker_reply_repeat_final_pad(offset, expected_rows):
+    # Prefill appends text EOS and PAD as the final two reply rows. The HF
+    # consumer retains the last PAD row for every remaining audio position.
     model = _make_minimal_model()
     input_ids = torch.tensor([1, 2, 3], dtype=torch.long)
     q = _thinker_reply(6)
@@ -107,12 +110,12 @@ def test_positions_past_thinker_reply_keep_codec_embedding():
         embed={"thinker_reply": q},
         _omni_is_prefill=False,
         _omni_prompt_len=2,
-        _omni_num_computed_tokens=7,  # offset 5: one reply row left
+        _omni_num_computed_tokens=2 + offset,
     )
 
     base = _fake_embed_input_ids(input_ids)
-    assert torch.equal(out_embeds[0], base[0] + q[5])
-    assert torch.equal(out_embeds[1:], base[1:])
+    assert torch.equal(out_embeds, base + q[expected_rows])
+    assert torch.equal(q, _thinker_reply(6))
 
 
 THINKER_PROMPT_LEN = 6
@@ -268,7 +271,7 @@ def test_replay_span_crossing_prompt_boundary_conditions_generated_suffix(num_co
     model = _make_prefill_model()
     payload = _thinker_payload()
     full_ids, full_embeds = _full_talker_prompt(model, payload)
-    generated = [301, 302, 303]
+    generated = list(range(301, 309))  # Includes EOS and several PAD-conditioned positions.
     span_ids = torch.cat(
         [
             torch.zeros(TALKER_PROMPT_LEN - num_computed, dtype=torch.long),
@@ -291,6 +294,15 @@ def test_replay_span_crossing_prompt_boundary_conditions_generated_suffix(num_co
     assert torch.equal(out_embeds[:num_prompt], full_embeds[num_computed:])
     assert out_ids[num_prompt:].tolist() == generated
     assert torch.equal(out_embeds[num_prompt:], _original_decode_embeds(model, payload, generated))
+    # Check the reference tail rule independently of our sequential decoder.
+    num_reply = payload["hidden_states"]["output"].shape[0] - 1
+    terminal_ids = torch.tensor(generated[num_reply:])
+    terminal_conditioning = torch.cat(
+        [model.embed_text_eos_token, model.embed_text_pad_token.expand(len(terminal_ids) - 1, -1)]
+    )
+    assert torch.equal(
+        out_embeds[num_prompt + num_reply :], _fake_embed_input_ids(terminal_ids) + terminal_conditioning
+    )
 
 
 def test_repeated_replay_span_is_identical():
@@ -298,7 +310,7 @@ def test_repeated_replay_span_is_identical():
     # the same span must rebuild identical embeddings.
     model = _make_prefill_model()
     payload = _thinker_payload()
-    span_ids = torch.cat([torch.zeros(TALKER_PROMPT_LEN, dtype=torch.long), torch.tensor([301, 302])])
+    span_ids = torch.cat([torch.zeros(TALKER_PROMPT_LEN, dtype=torch.long), torch.arange(301, 309)])
     meta = dict(_omni_is_prefill=True, _omni_prompt_len=TALKER_PROMPT_LEN, _omni_num_computed_tokens=0)
 
     _, first, _ = model.talker_preprocess(span_ids, None, **payload, **meta)

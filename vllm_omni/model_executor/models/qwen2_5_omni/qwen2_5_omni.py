@@ -746,7 +746,7 @@ class Qwen2_5OmniForConditionalGeneration(
         # schedule spans whose length does not identify their phase.
         # - Prompt positions take rows of the reconstructed Talker prompt.
         # - Generated positions add the request's ``thinker_reply`` row for their
-        #   generation offset; past the end of the reply, the codec embedding is kept.
+        #   generation offset, repeating its final text-PAD row after text ends.
         payload: OmniPayload = info_dict
         try:
             start = int(payload["_omni_num_computed_tokens"])
@@ -901,6 +901,8 @@ class Qwen2_5OmniForConditionalGeneration(
         rows are selected by position and ``thinker_reply`` is never consumed, so
         a single decode step, a speculative-decoding verify span and a
         preemption replay of the same positions all receive the same rows.
+        Prefill appends text EOS and PAD; the final PAD conditions every
+        remaining audio position, matching the reference decoder.
         """
         span_len = int(input_ids.shape[0])
         # Build the span embeddings from the codec ids rather than trusting the
@@ -916,6 +918,9 @@ class Qwen2_5OmniForConditionalGeneration(
             n = int(rows.shape[0])
             if n > 0:
                 input_embeds[:n] = input_embeds[:n] + rows.to(dtype=input_embeds.dtype, device=input_embeds.device)
+            if n < span_len:
+                pad = thinker_reply[-1:].to(dtype=input_embeds.dtype, device=input_embeds.device)
+                input_embeds[n:] = input_embeds[n:] + pad
         return input_ids, input_embeds, {}
 
     def compute_logits(self, hidden_states: torch.Tensor | OmniOutput, **kwargs: object) -> torch.Tensor | None:
