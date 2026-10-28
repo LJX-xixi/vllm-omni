@@ -122,6 +122,17 @@ def test_v1_decode_speaks_thinker_rows_that_arrived_during_chunked_prefill(rows_
     assert _v1_decode_text_steps(model, payload, arrivals) == [1, 2, 3, 4, 5, -1, -2]
 
 
+def test_v1_decode_rejects_negative_generation_offset():
+    model = _talker()
+    model.vllm_config.model_config.use_v2_model_runner = False
+    model.talker_config = Qwen3OmniMoeTalkerConfig(text_config={"hidden_size": _H})
+    payload = _prefilled_v1_payload(model, [_rows(1), _rows(2)])
+    payload.update(_omni_is_prefill=False, _omni_prompt_len=_PROMPT_LEN, _omni_num_computed_tokens=_PROMPT_LEN - 1)
+
+    with pytest.raises(ValueError, match="non-negative generation offset"):
+        model.talker_preprocess(torch.zeros(1, dtype=torch.long), torch.zeros((1, _H)), **payload)
+
+
 def test_make_omni_output_aligns_codes_to_request_spans():
     model = _talker()
     hidden = torch.zeros((8, _H))  # 5 real tokens + graph padding
