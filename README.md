@@ -119,9 +119,11 @@ identical waveforms or WER values.
 ## Relationship to the recorded run
 
 The recorded GPU pair used baseline `566d9521759efd40940ad9c567f1269da3475286`
-and candidate `b37f2a5216819f1e80e53ada8bec7fe59584b8be`. The current PR model
-file is identical to that candidate. These instructions reproduce the
-procedure using the PR head, not the exact historical source tree.
+and candidate `b37f2a5216819f1e80e53ada8bec7fe59584b8be`. The current PR uses
+the same decode-row calculation and also rejects negative generation offsets,
+propagating the error to the caller. That follow-up has CPU regression coverage;
+the GPU pair was not repeated. These instructions reproduce the procedure using
+the PR head, not the exact historical source tree.
 
 The shared driver, prompts and scoring algorithm retain their recorded
 behavior. For portability, the observer no longer loads a host-specific
